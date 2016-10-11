@@ -35,16 +35,24 @@
          error_tuple/4,
          format_error_source/2]).
 
--define(DEFAULT_COMPILER_SOURCE_FORMAT, relative).
+%% Internal
+-export([
+         distributed_compile_each/4
+        ]).
 
+-define(DEFAULT_COMPILER_SOURCE_FORMAT, relative).
+-define(DEFAULT_PARALLEL_NUM_FILES, 40).
 
 %% ===================================================================
 %% Public API
 %% ===================================================================
 
 run(Config, FirstFiles, RestFiles, CompileFn) ->
+    Parallel = rebar_opts:get(Config, parallel, false),
+
     %% Compile the first files in sequence
-    compile_each(FirstFiles++RestFiles, Config, CompileFn).
+    compile_each(FirstFiles, Config, CompileFn),
+    compile_wrapper(RestFiles, Config, CompileFn, Parallel).
 
 run(Config, FirstFiles, SourceDir, SourceExt, TargetDir, TargetExt,
     Compile3Fn) ->
@@ -128,6 +136,24 @@ remove_common_path1([Part | RestFilename], [Part | RestPath]) ->
 remove_common_path1(FilenameParts, _) ->
     filename:join(FilenameParts).
 
+compile_wrapper(Sources, Config, CompileFn, false) ->
+    %% Sequential compiling, default.
+    compile_each(Sources, Config, CompileFn);
+compile_wrapper(Sources, Config, CompileFn, SplitAt) when is_integer(SplitAt),
+                                                          SplitAt > 0 ->
+    %% Split into chunks of a user specifiedd length.
+    Pids = distribute_compile_jobs(Sources, Config, CompileFn, SplitAt),
+    collect_compile_jobs(Pids);
+compile_wrapper(Sources, Config, CompileFn, Parallel) when Parallel == 0 ->
+    %% Split into chunks of equal sizes for the schedulers.
+    SplitAt = length(Sources) / erlang:system_info(schedulers),
+    Pids = distribute_compile_jobs(Sources, Config, CompileFn, SplitAt),
+    collect_compile_jobs(Pids);
+compile_wrapper(Sources, Config, CompileFn, Parallel) when Parallel == true ->
+    %% Split into chunks of some standard size.
+    Pids = distribute_compile_jobs(Sources, Config, CompileFn, ?DEFAULT_PARALLEL_NUM_FILES),
+    collect_compile_jobs(Pids).
+
 compile_each([], _Config, _CompileFn) ->
     ok;
 compile_each([Source | Rest], Config, CompileFn) ->
@@ -147,6 +173,37 @@ compile_each([Source | Rest], Config, CompileFn) ->
             ?FAIL
     end,
     compile_each(Rest, Config, CompileFn).
+
+distributed_compile_each(Parent, Sources, Config, CompileFn) ->
+    case catch compile_each(Sources, Config, CompileFn) of
+        rebar_abort ->
+            Parent ! {rebar_abort, self()};
+        _ ->
+            Parent ! {compiled, self()}
+    end.
+
+distribute_compile_jobs(Sources, Config, CompileFn, SplitAt) ->
+    Chunks = split_into_chunks(Sources, SplitAt),
+    [spawn_link(?MODULE, distributed_compile_each,
+                [self(), Chunk, Config, CompileFn]) || Chunk <- Chunks].
+collect_compile_jobs([]) ->
+    ok;
+collect_compile_jobs(Pids) ->
+    receive
+        {rebar_abort, _Pid} ->
+            ?FAIL;
+        {compiled, Pid} ->
+            collect_compile_jobs(Pids -- [Pid])
+    end.
+
+split_into_chunks(Sources, SplitAt) ->
+    {_, Chunks} = lists:foldl(
+                    fun (S, {NumFiles, [Chunk|Acc]}) when NumFiles == SplitAt ->
+                            {1, [[S], Chunk|Acc]};
+                        (S, {NumFiles, [Chunk|Acc]}) ->
+                            {NumFiles+1, [[S|Chunk]|Acc]}
+                    end, {0, [[]]}, Sources),
+    Chunks.
 
 format_errors(Source, Errors) ->
     format_errors(Source, "", Errors).
